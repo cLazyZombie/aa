@@ -104,4 +104,3 @@ broker는 작고 고정된 signed executable로 두고 버전별 Rust core는 �
 | ssh-gui-app | 321.277 | 219.190 | 213.691 | 216.202 | 218.278 | 229.042 |
 
 단위 ms. 표본별 첫 실행·warm·target SHA256 및 PID·SID는 로컬 원본 JSON에 있다. 실험 child와 GUI 앱은 모두 자연 종료했고 마지막 `ps -axo pid,ppid,command` 확인에서 잔여 실험 프로세스는 없었다.
-
