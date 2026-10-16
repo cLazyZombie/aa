@@ -44,6 +44,34 @@ flowchart LR
 
 가져올 것: 실제 PTY, workspace/tab/pane, terminal 수명 분리, CLI와 API의 같은 기능 범위, snapshot+event, session identity, bounded output. 버릴 것: 접근자가 서버를 임의로 자동 기동하는 경로, 내부 bincode enum에 공개 호환성을 의존하는 방식, 책임 계보를 운영자가 매번 복구해야 하는 방식.
 
+### 이미지 붙여넣기 소스 확인
+
+사용자 추가 지시에 따라 같은 **v0.9.5 commit**의 다음 경로를 확인했다. 실제 clipboard를 읽거나 운영 pane에 이미지를 입력하지 않았으며, 이 절은 코드 분석이다.
+
+```mermaid
+flowchart LR
+  K[client · Ctrl+V / 빈 bracketed paste / 파일 drop] --> C[client OS clipboard 이미지 bytes]
+  C --> W[ClipboardImage · target / extension / data]
+  W --> SSH[기존 client transport · remote bridge]
+  SSH --> S[대상 herdr server · 크기·target 검사]
+  S --> F[대상 머신 temp 파일]
+  F --> P[절대 경로를 pane / terminal / popup Paste로 삽입]
+  P --> A[agent가 대상 머신 이미지 파일을 읽음]
+```
+
+| 확인 항목 | 소스에서 확인한 내용 |
+|---|---|
+| trigger·원격 구분 | [client/clipboard_images.rs](https://github.com/herdrdev/herdr/blob/v0.9.5/src/client/clipboard_images.rs)의 `endpoint_accepts_local_images`는 원격 client/endpoint 및 활성 surface를 요구한다. `should_bridge_clipboard_image_paste`는 기본 설정 Ctrl+V와 빈 bracketed paste를 판별하며, Windows는 대응하는 input event를 처리한다. 로컬 endpoint의 모든 Ctrl+V를 이 bridge가 처리한다고 해석하면 안 된다 |
+| 실제 입력 처리 | [client/mod.rs](https://github.com/herdrdev/herdr/blob/v0.9.5/src/client/mod.rs)에서 이미지 수집 성공 시 `write_remote_image_to_server` 후 원래 key 전송을 건너뛴다. 이미지가 없으면 일반 입력으로 계속 진행한다. 원격 terminal에 붙일 로컬 image-file 경로 drop도 파일 bytes를 읽어 보낸다 |
+| macOS 수집 | [platform/macos.rs](https://github.com/herdrdev/herdr/blob/v0.9.5/src/platform/macos.rs)의 `read_clipboard_image`는 osascript로 PNGf clipboard를 `herdr-clipboard-image-<pid>-<nanos>.png`에 잠시 저장하고 bytes를 읽은 뒤 이 **client-side** 파일을 지운다. 아래 server staging 파일과 다른 단계다 |
+| 다른 OS 수집 | [platform/windows.rs](https://github.com/herdrdev/herdr/blob/v0.9.5/src/platform/windows.rs)는 OpenClipboard·등록 PNG format·CF_DIBV5/CF_DIB→PNG 경로다. [platform/linux.rs](https://github.com/herdrdev/herdr/blob/v0.9.5/src/platform/linux.rs)는 wl-paste/xclip과 환경 DISPLAY/WAYLAND_DISPLAY를 사용한다. 이는 **client clipboard 수집**에 필요하며 원격 agent 머신의 clipboard를 공유하는 방식이 아니다 |
+| wire·크기 | [protocol/wire.rs](https://github.com/herdrdev/herdr/blob/v0.9.5/src/protocol/wire.rs)에 `ClientMessage::ClipboardImage`의 target/extension/data와 `MAX_CLIPBOARD_IMAGE_PAYLOAD=16MiB`가 있다. [server/client_transport.rs](https://github.com/herdrdev/herdr/blob/v0.9.5/src/server/client_transport.rs)가 초과 payload를 거부한다 |
+| 저장 경로·권한 | [server/clipboard_image.rs](https://github.com/herdrdev/herdr/blob/v0.9.5/src/server/clipboard_image.rs)의 `stage`가 `<temp>/herdr-clipboard-images-<euid>/client-<client_id>-clipboard-<nanos>-<attempt>.<extension>`을 create_new로 만든다. PNG 수집이면 `.png`, 지원 확장자는 png/jpg/gif/webp/bmp다. Unix는 directory 0700/file 0600, Windows suffix는 UID가 아니라 **server PID**이며 이 파일의 restrict 함수는 no-op다 |
+| agent 입력 | [server/headless.rs](https://github.com/herdrdev/herdr/blob/v0.9.5/src/server/headless.rs)의 `ClientClipboardImage` 처리와 `paste_client_clipboard_image_path`가 target을 검증하고 **server-local 절대 경로**를 Pane Paste·Popup Paste 또는 DirectTerminal 입력으로 넣는다. [terminal_attach.rs](https://github.com/herdrdev/herdr/blob/v0.9.5/src/server/terminal_attach.rs)는 terminal mode에 따른 paste payload를 만든다. 이미지 전송을 sixel/terminal graphics 렌더링과 혼동하지 않는다 |
+| 수명·한계 | 성공 staging 파일을 client의 staged_clipboard_files에 기록하고 client disconnect 때 지운다. 추가 stage 때 24시간 이상 된 파일도 정리한다. 따라서 client 수명과 agent의 지연 파일 읽기·resume 수명이 일치한다고 보장할 수 없다. 확장자 sanitize 자체는 수신 이미지 bytes의 완전한 decode 검증이 아니다 |
+
+새 aa 계획에서는 수집은 client, 검증·파일 생성은 **대상 OS agentd**, 입력 형식은 harness adapter가 소유한다. local/remote를 같은 attachment API로 처리하고 SHA256·길이 receipt 후만 경로를 입력한다. 경로만 다른 머신으로 보내지 않고 bytes를 전송한다. client detach만으로 파일을 삭제하지 않으며 session/thread 참조·보관 정책을 둔다. Windows는 명시적 SID ACL, 세 OS native 경로·인용·이미지 소비 E2E를 적용한다. 이는 제품 구현이 아닌 [기획서의 필수 기능·아키텍처·검증 계획](plan.md)이다.
+
 ## herdr-projects v0.2.35
 
 ```mermaid
@@ -117,10 +145,13 @@ flowchart LR
 - MachineRelay는 인증된 원격 WebSocket을 중계하고 xterm 처리 ACK를 통과시킨다. 출력량·정체 시간을 제한하고 overload는 명시 종료한다. 느린 모바일이 전체 PTY를 무한히 막지 않도록 bounded buffer와 재동기화가 필요하다.
 - 인증은 shared token, HttpOnly·SameSite cookie, TLS에서 Secure, 장치별 pairing/권한, Tailscale identity를 조합한다. 빈 token이 곧 항상 안전함을 뜻하지 않으며 `access.ts`의 위치·identity 정책을 함께 봐야 한다. Origin 검사·변경 권한 재확인이 있다. 새 설계에서는 loopback에서도 웹 요청을 인증하고 proxy identity는 명시적으로 신뢰한 경로에서만 받는다.
 - 모바일은 단순 CSS 축소를 넘는다. PhonePanel, 입력용 composer, IME composition 처리, 키보드 때문에 변하는 viewport, touch/pinch·고정 grid·비활성 tab의 resize 억제가 들어 있다. 초기 aa도 터미널만 작게 넣으면 모바일 사용성이 충족되지 않는다.
+- **웹 이미지 paste.** Composer의 `onPaste`가 clipboardData file items를 모아 업로드하고 `imageMention`으로 `@path`를 초안에 넣는다. PaneTerminal의 terminal paste는 text-only 동작을 유지하며 file-only paste를 업로드한 뒤 경로를 붙인다. `useMachineApi`가 업로드 시점의 machine ID를 묶고 `/api/machines/<id>/pane/image`를 machine API가 원격 bridge의 `/api/pane/image`로 proxy한다. 실제 파일은 **대상 머신**의 `<pane cwd>/.herdr-web-ui/paste-<stamp>-<uuid>.<ext>`에 0600으로 쓰며 cwd 부재 시 temp fallback, HERDR_WEB_PASTE_DIR override가 있다. 웹 제한은 32MiB이고 base64 JSON body를 사용하므로 herdr native bridge의 16MiB와 같은 경로·제한이 아니다. aa는 streaming binary upload·공통 정책을 추천하며 agent별로 검증하기 전 `@path`나 POSIX single quote를 보편 규칙으로 가져오지 않는다.
 
 근거: [index.ts](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/server/index.ts), [herdr/client.ts](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/server/herdr/client.ts), [pty/session.ts](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/server/pty/session.ts), [remote-entry.ts](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/server/remote-entry.ts), [machine-relay.ts](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/server/machine-relay.ts), [auth.ts](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/server/auth.ts), [access.ts](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/server/access.ts), [TerminalInput.tsx](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/src/components/TerminalInput.tsx).
 
 가져올 것: terminal/chat 전환 개념, 모바일 입력, 읽기/조작 권한, output ACK와 제한, 기기별 연결 상태. 줄일 것: Bun→Node→herdr의 다층 실행, 웹 서버의 agent 서버 자동 설치·기동, 거대한 vendor별 transcript 파서를 MVP에 모두 포함하는 범위. Rust 웹 gateway가 기존 agent API에 붙고 PTY 생성은 하지 않도록 한다.
+
+이미지 흐름 추가 근거: [Composer.tsx](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/src/components/Composer.tsx), [PaneTerminal.tsx](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/src/components/PaneTerminal.tsx), [compose.ts](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/src/lib/compose.ts), [machineContext.tsx](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/src/lib/machineContext.tsx), [api.ts](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/src/lib/api.ts), [machine-api.ts](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/server/machine-api.ts), [paste.ts](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/server/paste.ts), [attachments.ts](https://github.com/devswha/herdr-web-ui/blob/aa624cb56f550f9a7dd8bf4d59ed99ffc3921741/shared/attachments.ts).
 
 ## mac-b mobile-relay는 별도 제품이다
 
